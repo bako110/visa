@@ -1,8 +1,8 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    mongo_uri: str = "mongodb://localhost:27017"
-    database_name: str = "visa_db"
+    mongo_uri: str
+    database_name: str
 
     # SMTP
     smtp_host: str
