@@ -16,3 +16,4 @@ watchfiles
 pytest
 httpx
 celery
+twilio
