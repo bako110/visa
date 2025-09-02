@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from app.utils.email import send_verification_email
 from app.utils.whatsapp import send_whatsapp_code
-from app.schemas.user import UserCreate, UserResponse
+from app.schemas.user import UserCreate, UserResponse, LoginRequest
 from app.crud.user import create_user, get_user_by_email
 from app.config import settings
 from app.utils.pin import set_user_pin, verify_user_pin
@@ -260,3 +260,48 @@ async def check_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
             status_code=500,
             detail="Erreur lors de la vérification du PIN"
         )
+
+@router.post("/login")
+async def login(request: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
+    """
+    Login utilisateur avec mot de passe ou PIN + option device_id.
+    """
+    try:
+        user = None
+
+        # Login classique (email ou téléphone + mot de passe)
+        if request.email or request.phone:
+            if request.email:
+                user = await get_user_by_email(db, request.email)
+            # Ajouter get_user_by_phone si login par téléphone
+            if not user:
+                raise HTTPException(status_code=400, detail="Utilisateur introuvable")
+            if not request.password or not pwd_context.verify(request.password, user["password"]):
+                raise HTTPException(status_code=400, detail="Mot de passe incorrect")
+
+        # Login rapide par PIN + device_id
+        elif request.pin and request.device_id:
+            if request.email:
+                user = await get_user_by_email(db, request.email)
+            # Ajouter récupération par téléphone si nécessaire
+            if not user:
+                raise HTTPException(status_code=400, detail="Utilisateur introuvable")
+            is_valid = await verify_user_pin(db, str(user["_id"]), request.pin)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail="PIN incorrect")
+
+        else:
+            raise HTTPException(status_code=400, detail="Informations de connexion manquantes")
+
+        # Retour user
+        user["_id"] = str(user["_id"])
+        return {
+            "success": True,
+            "message": "Connexion réussie",
+            "user": user
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors du login: {str(e)}")
