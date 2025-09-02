@@ -2,15 +2,20 @@ from fastapi import APIRouter, HTTPException, Depends
 from random import randint
 from pydantic import BaseModel, EmailStr
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from passlib.context import CryptContext
 from app.utils.email import send_verification_email
 from app.utils.whatsapp import send_whatsapp_code
 from app.schemas.user import UserCreate, UserResponse, LoginRequest
-from app.crud.user import create_user, get_user_by_email
+from app.crud.user import create_user, get_user_by_email, get_user_by_phone
 from app.config import settings
 from app.utils.pin import set_user_pin, verify_user_pin
 from typing import Optional
- 
+from bson import ObjectId
+
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Configuration du hachage des mots de passe
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Connexion à MongoDB
 client = AsyncIOMotorClient(settings.mongo_uri)
@@ -42,9 +47,25 @@ class PinData(BaseModel):
     user_id: str
     pin: str
 
+# Schéma de connexion enrichi
+class LoginRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    password: Optional[str] = None
+    pin: Optional[str] = None
+    device_id: Optional[str] = None
+
 # Dépendance pour récupérer la DB
 async def get_db() -> AsyncIOMotorDatabase:
     return db
+
+# Fonction helper pour valider ObjectId
+def is_valid_object_id(user_id: str) -> bool:
+    try:
+        ObjectId(user_id)
+        return True
+    except:
+        return False
 
 # --- Étape 1: Envoi code email ---
 @router.post("/send-email-code")
@@ -194,19 +215,22 @@ async def final_register(user: UserCreate, db: AsyncIOMotorDatabase = Depends(ge
             )
 
         # Créer l'utilisateur
-        created_user = await create_user(db, user)
+        result = await create_user(db, user)
+        user_id = str(result.inserted_id)
+
+        # Relire le user complet
+        created_user = await db.users.find_one({"_id": result.inserted_id})
+        if created_user:
+            created_user["_id"] = str(created_user["_id"])
 
         # Nettoyer les sets de vérification
         verified_emails.discard(user.email)
         verified_phones.discard(user.phone)
 
-        # Convertir ObjectId en string
-        created_user["_id"] = str(created_user["_id"])
-
         return {
             "success": True,
             "message": "Compte créé avec succès",
-            "user": created_user  # 🔥 Retour complet, y compris l'id
+            "user": created_user
         }
 
     except HTTPException:
@@ -225,15 +249,39 @@ async def create_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
     Définir le code PIN pour un utilisateur.
     """
     try:
+        # Valider l'ID utilisateur
+        if not is_valid_object_id(data.user_id):
+            raise HTTPException(
+                status_code=400,
+                detail="ID utilisateur invalide"
+            )
+        
+        # Valider le format du PIN (4-6 chiffres)
+        if not data.pin.isdigit() or not (4 <= len(data.pin) <= 6):
+            raise HTTPException(
+                status_code=400,
+                detail="Le PIN doit contenir entre 4 et 6 chiffres"
+            )
+        
+        # Vérifier que l'utilisateur existe
+        user = await db.users.find_one({"_id": ObjectId(data.user_id)})
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="Utilisateur introuvable"
+            )
+        
         await set_user_pin(db, data.user_id, data.pin)
         return {
             "success": True,
             "message": "PIN défini avec succès"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="Erreur lors de la définition du PIN"
+            detail=f"Erreur lors de la définition du PIN: {str(e)}"
         )
 
 @router.post("/verify-pin")
@@ -242,6 +290,21 @@ async def check_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
     Vérifier le code PIN d'un utilisateur.
     """
     try:
+        # Valider l'ID utilisateur
+        if not is_valid_object_id(data.user_id):
+            raise HTTPException(
+                status_code=400,
+                detail="ID utilisateur invalide"
+            )
+        
+        # Vérifier que l'utilisateur existe
+        user = await db.users.find_one({"_id": ObjectId(data.user_id)})
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail="Utilisateur introuvable"
+            )
+        
         is_valid = await verify_user_pin(db, data.user_id, data.pin)
         if not is_valid:
             raise HTTPException(
@@ -251,14 +314,15 @@ async def check_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
 
         return {
             "success": True,
-            "message": "PIN valide"
+            "message": "PIN valide",
+            "user_id": data.user_id
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail="Erreur lors de la vérification du PIN"
+            detail=f"Erreur lors de la vérification du PIN: {str(e)}"
         )
 
 @router.post("/login")
@@ -269,39 +333,132 @@ async def login(request: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db
     try:
         user = None
 
-        # Login classique (email ou téléphone + mot de passe)
-        if request.email or request.phone:
-            if request.email:
-                user = await get_user_by_email(db, request.email)
-            # Ajouter get_user_by_phone si login par téléphone
-            if not user:
-                raise HTTPException(status_code=400, detail="Utilisateur introuvable")
-            if not request.password or not pwd_context.verify(request.password, user["password"]):
-                raise HTTPException(status_code=400, detail="Mot de passe incorrect")
+        # Validation des paramètres d'entrée
+        if not any([request.email, request.phone]):
+            raise HTTPException(
+                status_code=400, 
+                detail="Email ou téléphone requis"
+            )
 
-        # Login rapide par PIN + device_id
-        elif request.pin and request.device_id:
+        # Login classique (email ou téléphone + mot de passe)
+        if request.password:
             if request.email:
                 user = await get_user_by_email(db, request.email)
-            # Ajouter récupération par téléphone si nécessaire
+            elif request.phone:
+                user = await get_user_by_phone(db, request.phone)
+            
             if not user:
-                raise HTTPException(status_code=400, detail="Utilisateur introuvable")
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Email/téléphone ou mot de passe incorrect"
+                )
+            
+            # Vérifier le mot de passe
+            if not pwd_context.verify(request.password, user["password"]):
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Email/téléphone ou mot de passe incorrect"
+                )
+
+        # Login rapide par PIN
+        elif request.pin:
+            if request.email:
+                user = await get_user_by_email(db, request.email)
+            elif request.phone:
+                user = await get_user_by_phone(db, request.phone)
+            
+            if not user:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Utilisateur introuvable"
+                )
+            
+            # Vérifier le PIN
             is_valid = await verify_user_pin(db, str(user["_id"]), request.pin)
             if not is_valid:
-                raise HTTPException(status_code=400, detail="PIN incorrect")
+                raise HTTPException(
+                    status_code=401, 
+                    detail="PIN incorrect"
+                )
 
         else:
-            raise HTTPException(status_code=400, detail="Informations de connexion manquantes")
+            raise HTTPException(
+                status_code=400, 
+                detail="Mot de passe ou PIN requis"
+            )
 
-        # Retour user
-        user["_id"] = str(user["_id"])
+        # Mettre à jour le device_id si fourni
+        if request.device_id and user:
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"device_id": request.device_id, "last_login": "2025-09-03T00:00:00Z"}}
+            )
+
+        # Préparer la réponse (exclure le mot de passe et le PIN hashé)
+        user_response = {k: v for k, v in user.items() if k not in ["password", "pin_hash"]}
+        user_response["_id"] = str(user_response["_id"])
+        
         return {
             "success": True,
             "message": "Connexion réussie",
-            "user": user
+            "user": user_response
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors du login: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Erreur lors du login: {str(e)}"
+        )
+
+# --- Endpoint pour changer le PIN ---
+@router.post("/change-pin")
+async def change_pin(
+    old_pin_data: dict, 
+    new_pin: str, 
+    db: AsyncIOMotorDatabase = Depends(get_db)
+):
+    """
+    Changer le PIN d'un utilisateur après vérification de l'ancien PIN.
+    """
+    try:
+        user_id = old_pin_data.get("user_id")
+        old_pin = old_pin_data.get("old_pin")
+        
+        if not user_id or not old_pin:
+            raise HTTPException(
+                status_code=400,
+                detail="ID utilisateur et ancien PIN requis"
+            )
+        
+        # Vérifier l'ancien PIN
+        is_valid = await verify_user_pin(db, user_id, old_pin)
+        if not is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Ancien PIN incorrect"
+            )
+        
+        # Valider le nouveau PIN
+        if not new_pin.isdigit() or not (4 <= len(new_pin) <= 6):
+            raise HTTPException(
+                status_code=400,
+                detail="Le nouveau PIN doit contenir entre 4 et 6 chiffres"
+            )
+        
+        # Définir le nouveau PIN
+        await set_user_pin(db, user_id, new_pin)
+        
+        return {
+            "success": True,
+            "message": "PIN modifié avec succès"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du changement de PIN: {str(e)}"
+        )
