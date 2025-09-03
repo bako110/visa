@@ -5,47 +5,104 @@ from bson import ObjectId
 from typing import Optional, Dict, Any
 from datetime import datetime
 import pymongo
+import random
+import io
+import base64
+from PIL import Image, ImageDraw, ImageFont
 
 # Configuration du contexte de hachage
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
+def generate_default_avatar(name: str) -> str:
+    """
+    Génère un avatar par défaut avec les initiales et une couleur aléatoire.
+    Lettres plus grandes et centrées.
+    """
+    colors = ["#1abc9c", "#3498db", "#9b59b6", "#e67e22", "#e74c3c", "#2ecc71", "#f1c40f"]
+    bg_color = random.choice(colors)
+    text_color = "#ffffff"
+
+    # Prendre les initiales
+    initials = "".join([word[0].upper() for word in name.split()[:2]])
+
+    # Créer l'image
+    img_size = 128
+    img = Image.new('RGB', (img_size, img_size), color=bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Utiliser une police TTF pour des lettres plus grandes
+    font_size = 64  # Ajustable selon la taille de l'image
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except IOError:
+        font = ImageFont.load_default()
+
+    # Calculer la taille du texte pour le centrer
+    bbox = draw.textbbox((0, 0), initials, font=font)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+
+    # Centrer le texte
+    draw.text(((img_size - w) / 2, (img_size - h) / 2), initials, fill=text_color, font=font)
+
+    # Convertir en base64
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
+
+
 async def create_user(db: AsyncIOMotorDatabase, user: UserCreate) -> pymongo.results.InsertOneResult:
     """
-    Créer un nouvel utilisateur avec mot de passe haché et timestamps.
-    
-    Args:
-        db: Base de données MongoDB
-        user: Données utilisateur à créer
-        
-    Returns:
-        InsertOneResult: Résultat de l'insertion
-        
-    Raises:
-        Exception: Si l'insertion échoue
+    Créer un nouvel utilisateur avec mot de passe haché, avatar par défaut et timestamps.
     """
     try:
+        # Vérifier que le mot de passe est fourni
+        if not user.password:
+            raise ValueError("Le mot de passe est requis pour l'inscription")
+
         # Hacher le mot de passe
         hashed_password = pwd_context.hash(user.password)
         
         # Préparer les données utilisateur
         user_dict = user.dict(exclude_unset=True)  # Exclut les valeurs non définies
+
+        # Nom pour avatar (par défaut "U" si vide)
+        name_for_avatar = user_dict.get("name") or "U"
+
+        # Avatar par défaut si non fourni
+        if not user_dict.get("avatar"):
+            user_dict["avatar"] = generate_default_avatar(name_for_avatar)
+        
+        # Si device_id n'est pas fourni, initialiser à None
+        if 'device_id' not in user_dict:
+            user_dict['device_id'] = None
+
+        # Compléter les champs supplémentaires
         user_dict.update({
             "password": hashed_password,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             "is_active": True,
             "is_verified": True,  # Puisque l'email et le téléphone sont déjà vérifiés
-            "pin_hash": None,  # Sera défini plus tard si nécessaire
-            "device_id": None,
+            "pin_hash": None,      # Sera défini plus tard si nécessaire
             "last_login": None
         })
         
-        # Insérer l'utilisateur
+        # Insérer l'utilisateur dans la base
         result = await db.users.insert_one(user_dict)
         return result
         
     except Exception as e:
-        raise Exception(f"Erreur lors de la création de l'utilisateur: {str(e)}")
+        # Journaliser l'erreur pour le debug
+        import logging
+        logging.exception("Erreur lors de la création de l'utilisateur")
+        # Lever une exception plus descriptive
+        raise Exception(f"Impossible de créer l'utilisateur: {str(e)}")
+
+
 
 async def get_user_by_email(db: AsyncIOMotorDatabase, email: str) -> Optional[Dict[str, Any]]:
     """
@@ -130,9 +187,13 @@ async def update_user(db: AsyncIOMotorDatabase, user_id: str, update_data: Dict[
     except Exception as e:
         raise Exception(f"Erreur lors de la mise à jour: {str(e)}")
 
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from bson import ObjectId
+from datetime import datetime
+
 async def delete_user(db: AsyncIOMotorDatabase, user_id: str) -> bool:
     """
-    Supprimer un utilisateur (soft delete - marquer comme inactif).
+    Supprimer complètement un utilisateur de la base de données.
     
     Args:
         db: Base de données MongoDB
@@ -144,19 +205,12 @@ async def delete_user(db: AsyncIOMotorDatabase, user_id: str) -> bool:
     try:
         if not ObjectId.is_valid(user_id):
             return False
-            
-        result = await db.users.update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {
-                "is_active": False,
-                "deleted_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
-            }}
-        )
-        
-        return result.modified_count > 0
+
+        result = await db.users.delete_one({"_id": ObjectId(user_id)})
+        return result.deleted_count > 0
     except Exception as e:
         raise Exception(f"Erreur lors de la suppression: {str(e)}")
+
 
 async def verify_password(hashed_password: str, plain_password: str) -> bool:
     """

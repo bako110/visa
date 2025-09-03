@@ -6,7 +6,7 @@ from passlib.context import CryptContext
 from app.utils.email import send_verification_email
 from app.utils.whatsapp import send_whatsapp_code
 from app.schemas.user import UserCreate, UserResponse, LoginRequest
-from app.crud.user import create_user, get_user_by_email, get_user_by_phone
+from app.crud.user import create_user, get_user_by_email, get_user_by_phone, delete_user
 from app.config import settings
 from app.utils.pin import set_user_pin, verify_user_pin
 from typing import Optional
@@ -189,24 +189,29 @@ async def verify_phone_code(request: VerifyPhoneCodeRequest):
             detail="Erreur lors de la vérification du code WhatsApp"
         )
 
+
 # --- Étape 5: Création utilisateur final ---
 @router.post("/final-register")
 async def final_register(user: UserCreate, db: AsyncIOMotorDatabase = Depends(get_db)):
+    """
+    Inscription finale : Crée un utilisateur et retourne toutes ses infos.
+    """
     try:
-        # Vérifier que l'email et le téléphone ont été vérifiés
+        # Vérifier email vérifié
         if user.email not in verified_emails:
             raise HTTPException(
                 status_code=400,
                 detail="L'adresse email n'a pas été vérifiée"
             )
 
+        # Vérifier téléphone vérifié
         if user.phone not in verified_phones:
             raise HTTPException(
                 status_code=400,
                 detail="Le numéro de téléphone n'a pas été vérifié"
             )
 
-        # Vérifier si l'email existe déjà
+        # Vérifier si email existe déjà
         existing_user = await get_user_by_email(db, user.email)
         if existing_user:
             raise HTTPException(
@@ -216,17 +221,27 @@ async def final_register(user: UserCreate, db: AsyncIOMotorDatabase = Depends(ge
 
         # Créer l'utilisateur
         result = await create_user(db, user)
-        user_id = str(result.inserted_id)
+        user_id = result.inserted_id
 
-        # Relire le user complet
-        created_user = await db.users.find_one({"_id": result.inserted_id})
-        if created_user:
-            created_user["_id"] = str(created_user["_id"])
+        # 🔥 Récupérer et afficher toutes les infos
+        created_user = await db.users.find_one({"_id": user_id})
+        if not created_user:
+            raise HTTPException(
+                status_code=500,
+                detail="Utilisateur non trouvé après création"
+            )
 
-        # Nettoyer les sets de vérification
+        # Convertir ObjectId en str
+        created_user["_id"] = str(created_user["_id"])
+
+        # 🔥 Debug complet dans la console
+        # print("[DEBUG] Nouvel utilisateur créé :", created_user)
+
+        # Nettoyage des vérifications
         verified_emails.discard(user.email)
         verified_phones.discard(user.phone)
 
+        # Retour complet
         return {
             "success": True,
             "message": "Compte créé avec succès",
@@ -242,47 +257,66 @@ async def final_register(user: UserCreate, db: AsyncIOMotorDatabase = Depends(ge
         )
 
 
-# --- Gestion du PIN ---
+# --- Gestion du PIN améliorée avec token ---
 @router.post("/set-pin")
 async def create_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
     """
-    Définir le code PIN pour un utilisateur.
+    Définir le code PIN pour un utilisateur et retourner le token JWT.
+    Si la création du PIN échoue, supprimer l'utilisateur.
     """
     try:
         # Valider l'ID utilisateur
         if not is_valid_object_id(data.user_id):
-            raise HTTPException(
-                status_code=400,
-                detail="ID utilisateur invalide"
-            )
-        
+            raise HTTPException(status_code=400, detail="ID utilisateur invalide")
+
         # Valider le format du PIN (4-6 chiffres)
         if not data.pin.isdigit() or not (4 <= len(data.pin) <= 6):
-            raise HTTPException(
-                status_code=400,
-                detail="Le PIN doit contenir entre 4 et 6 chiffres"
-            )
-        
+            raise HTTPException(status_code=400, detail="Le PIN doit contenir entre 4 et 6 chiffres")
+
         # Vérifier que l'utilisateur existe
         user = await db.users.find_one({"_id": ObjectId(data.user_id)})
         if not user:
-            raise HTTPException(
-                status_code=404,
-                detail="Utilisateur introuvable"
-            )
-        
-        await set_user_pin(db, data.user_id, data.pin)
+            raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+
+        # Définir le PIN et générer le token
+        access_token = await set_user_pin(db, data.user_id, data.pin)
+
+        # Préparer le profil utilisateur pour le retour
+        user_profile = {
+            "_id": str(user["_id"]),
+            "name": user.get("name"),
+            "email": user.get("email"),
+            "avatar": user.get("avatar"),   
+            "phone": user.get("phone"),
+            "is_active": user.get("is_active", True),
+            "created_at": user.get("created_at"),
+            "updated_at": user.get("updated_at"),
+        }
+
         return {
             "success": True,
-            "message": "PIN défini avec succès"
+            "message": "PIN défini avec succès",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": user_profile
         }
+
     except HTTPException:
         raise
     except Exception as e:
+        # Suppression de l'utilisateur si une erreur survient
+        try:
+            await db.users.delete_one({"_id": ObjectId(data.user_id)})
+            print(f"[DEBUG] Utilisateur {data.user_id} supprimé après échec du PIN")
+        except Exception as delete_err:
+            print(f"[ERROR] Impossible de supprimer l'utilisateur après échec: {delete_err}")
+        
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la définition du PIN: {str(e)}"
         )
+
+
 
 @router.post("/verify-pin")
 async def check_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
@@ -462,3 +496,15 @@ async def change_pin(
             status_code=500,
             detail=f"Erreur lors du changement de PIN: {str(e)}"
         )
+
+# suppression des utilsateur
+
+@router.delete("/delete-user")
+async def delete_user_route(user_id: str, db: AsyncIOMotorDatabase = Depends(get_db)):
+    """
+    Endpoint pour supprimer un utilisateur par ID (soft delete).
+    """
+    success = await delete_user(db, user_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Suppression échouée ou utilisateur introuvable")
+    return {"success": True, "message": "Utilisateur supprimé avec succès"}
