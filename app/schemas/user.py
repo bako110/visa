@@ -17,6 +17,7 @@ class UserResponse(BaseModel):
     phone: str
     name: str
     avatar: Optional[str] = None  # Ajout si tu veux renvoyer l'avatar
+    balance: float = 0.0  # Ajout du solde
 
 
 # --- Schéma pour la requête de connexion ---

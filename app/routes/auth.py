@@ -8,9 +8,11 @@ from app.utils.whatsapp import send_whatsapp_code
 from app.schemas.user import UserCreate, UserResponse, LoginRequest
 from app.crud.user import create_user, get_user_by_email, get_user_by_phone, delete_user
 from app.config import settings
-from app.utils.pin import set_user_pin, verify_user_pin
+from app.utils.pin import set_user_pin, verify_user_pin, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from typing import Optional
 from bson import ObjectId
+from datetime import datetime, timedelta, timezone
+
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -286,7 +288,8 @@ async def create_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
             "_id": str(user["_id"]),
             "name": user.get("name"),
             "email": user.get("email"),
-            "avatar": user.get("avatar"),   
+            "avatar": user.get("avatar"), 
+            "balance": user.get("balance", 0.0),
             "phone": user.get("phone"),
             "is_active": user.get("is_active", True),
             "created_at": user.get("created_at"),
@@ -362,89 +365,82 @@ async def check_pin(data: PinData, db: AsyncIOMotorDatabase = Depends(get_db)):
 @router.post("/login")
 async def login(request: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
     """
-    Login utilisateur avec mot de passe ou PIN + option device_id.
+    Login utilisateur par mot de passe ou PIN.
+    Retourne un JWT + toutes les infos utilisateur.
     """
     try:
         user = None
 
-        # Validation des paramètres d'entrée
-        if not any([request.email, request.phone]):
-            raise HTTPException(
-                status_code=400, 
-                detail="Email ou téléphone requis"
-            )
+        # Vérification email ou téléphone
+        if request.email:
+            user = await db.users.find_one({"email": request.email})
+        elif request.phone:
+            user = await db.users.find_one({"phone": request.phone})
+        else:
+            raise HTTPException(status_code=400, detail="Email ou téléphone requis")
 
-        # Login classique (email ou téléphone + mot de passe)
+        if not user:
+            raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+
+        # Vérification par mot de passe
         if request.password:
-            if request.email:
-                user = await get_user_by_email(db, request.email)
-            elif request.phone:
-                user = await get_user_by_phone(db, request.phone)
-            
-            if not user:
-                raise HTTPException(
-                    status_code=401, 
-                    detail="Email/téléphone ou mot de passe incorrect"
-                )
-            
-            # Vérifier le mot de passe
             if not pwd_context.verify(request.password, user["password"]):
-                raise HTTPException(
-                    status_code=401, 
-                    detail="Email/téléphone ou mot de passe incorrect"
-                )
+                raise HTTPException(status_code=401, detail="Mot de passe incorrect")
 
-        # Login rapide par PIN
+        # Vérification par PIN
         elif request.pin:
-            if request.email:
-                user = await get_user_by_email(db, request.email)
-            elif request.phone:
-                user = await get_user_by_phone(db, request.phone)
-            
-            if not user:
-                raise HTTPException(
-                    status_code=401, 
-                    detail="Utilisateur introuvable"
-                )
-            
-            # Vérifier le PIN
-            is_valid = await verify_user_pin(db, str(user["_id"]), request.pin)
-            if not is_valid:
-                raise HTTPException(
-                    status_code=401, 
-                    detail="PIN incorrect"
-                )
+            if not user.get("pin"):
+                raise HTTPException(status_code=400, detail="Aucun PIN défini pour cet utilisateur")
+
+            if not pwd_context.verify(request.pin, user["pin"]):
+                raise HTTPException(status_code=401, detail="PIN incorrect")
 
         else:
-            raise HTTPException(
-                status_code=400, 
-                detail="Mot de passe ou PIN requis"
-            )
+            raise HTTPException(status_code=400, detail="Mot de passe ou PIN requis")
 
-        # Mettre à jour le device_id si fourni
-        if request.device_id and user:
-            await db.users.update_one(
-                {"_id": user["_id"]},
-                {"$set": {"device_id": request.device_id, "last_login": "2025-09-03T00:00:00Z"}}
-            )
+        # Mise à jour du last_login
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"last_login": datetime.utcnow()}}
+        )
 
-        # Préparer la réponse (exclure le mot de passe et le PIN hashé)
-        user_response = {k: v for k, v in user.items() if k not in ["password", "pin_hash"]}
-        user_response["_id"] = str(user_response["_id"])
-        
+        # Génération du token JWT avec user_id + email + phone
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            user_id=str(user["_id"]),
+            email=user.get("email"),
+            phone=user.get("phone"),
+            expires_delta=access_token_expires,
+        )
+
+        # Réponse complète
         return {
-            "success": True,
-            "message": "Connexion réussie",
-            "user": user_response
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # en secondes
+            "user": {
+                "id": str(user["_id"]),
+                "email": user.get("email"),
+                "phone": user.get("phone"),
+                "name": user.get("name"),
+                "avatar": user.get("avatar"),
+                "device_id": user.get("device_id"),
+                "is_active": user.get("is_active", False),
+                "is_verified": user.get("is_verified", False),
+                "created_at": user.get("created_at"),
+                "updated_at": user.get("updated_at"),
+                "last_login": datetime.utcnow().isoformat()
+            }
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Erreur lors du login: {str(e)}"
-        )
+        import traceback
+        print("Erreur login:", e)
+        traceback.print_exc()  # pour voir l’erreur exacte dans les logs
+        raise HTTPException(status_code=500, detail="Erreur interne du serveur")
+
 
 # --- Endpoint pour changer le PIN ---
 @router.post("/change-pin")

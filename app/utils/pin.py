@@ -59,9 +59,14 @@ async def verify_user_pin(db: AsyncIOMotorDatabase, user_id: str, pin: str) -> O
     return None
 
 
-def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    user_id: str,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    expires_delta: Optional[timedelta] = None
+) -> str:
     """
-    Crée un token JWT pour l'utilisateur.
+    Crée un token JWT pour l'utilisateur avec user_id, email et/ou phone.
     """
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
@@ -69,11 +74,17 @@ def create_access_token(user_id: str, expires_delta: Optional[timedelta] = None)
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode = {
-        "sub": user_id,  # Subject (ID utilisateur)
-        "exp": expire,   # Expiration
+        "sub": user_id,              # Subject (ID utilisateur)
+        "exp": expire,               # Expiration
         "iat": datetime.now(timezone.utc),  # Issued at
-        "jti": secrets.token_hex(16)  # JWT ID unique
+        "jti": secrets.token_hex(16)        # JWT ID unique
     }
+
+    # Ajout conditionnel de l'email et du téléphone
+    if email:
+        to_encode["email"] = email
+    if phone:
+        to_encode["phone"] = phone
     
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -93,41 +104,41 @@ def verify_access_token(token: str) -> Optional[str]:
         return None
 
 
-async def authenticate_with_pin(db: AsyncIOMotorDatabase, user_id: str, pin: str) -> dict:
-    """
-    Authentifie un utilisateur avec son PIN et retourne les informations de connexion.
-    """
-    token = await verify_user_pin(db, user_id, pin)
+# async def authenticate_with_pin(db: AsyncIOMotorDatabase, user_id: str, pin: str) -> dict:
+#     """
+#     Authentifie un utilisateur avec son PIN et retourne les informations de connexion.
+#     """
+#     token = await verify_user_pin(db, user_id, pin)
     
-    if not token:
-        raise HTTPException(
-            status_code=401, 
-            detail="PIN incorrect ou utilisateur introuvable"
-        )
+#     if not token:
+#         raise HTTPException(
+#             status_code=401, 
+#             detail="PIN incorrect ou utilisateur introuvable"
+#         )
     
-    print(f"[DEBUG] Token retourné (authenticate_with_pin): {token}")  # 🔥 LOG ICI
+#     print(f"[DEBUG] Token retourné (authenticate_with_pin): {token}")  # 🔥 LOG ICI
     
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60  # en secondes
-    }
+#     return {
+#         "access_token": token,
+#         "token_type": "bearer",
+#         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60  # en secondes
+#     }
 
 
-async def refresh_token(db: AsyncIOMotorDatabase, current_token: str) -> Optional[str]:
-    """
-    Rafraîchit un token existant s'il est valide.
-    """
-    user_id = verify_access_token(current_token)
-    if not user_id:
-        return None
+# async def refresh_token(db: AsyncIOMotorDatabase, current_token: str) -> Optional[str]:
+#     """
+#     Rafraîchit un token existant s'il est valide.
+#     """
+#     user_id = verify_access_token(current_token)
+#     if not user_id:
+#         return None
     
-    # Vérifier que l'utilisateur existe toujours
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
-    if not user:
-        return None
+#     # Vérifier que l'utilisateur existe toujours
+#     user = await db.users.find_one({"_id": ObjectId(user_id)})
+#     if not user:
+#         return None
     
-    # Générer un nouveau token
-    new_token = create_access_token(user_id)
-    print(f"[DEBUG] Nouveau token généré (refresh_token): {new_token}")  # 🔥 LOG ICI
-    return new_token
+#     # Générer un nouveau token
+#     new_token = create_access_token(user_id)
+#     print(f"[DEBUG] Nouveau token généré (refresh_token): {new_token}")  # 🔥 LOG ICI
+#     return new_token
