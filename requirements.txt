@@ -16,4 +16,5 @@ watchfiles
 pytest
 httpx
 celery
+Pillow==10.0.0
 twilio
